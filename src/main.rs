@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
+use std::net::SocketAddr;
 use std::net::UdpSocket;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -78,31 +79,37 @@ impl BufHandler {
 
     fn read_qname(&mut self, out: &mut String) -> Result<(), String> {
         let mut delim = "";
-        let mut cur_pos = 0;
+        let mut jumped = false;
+        let mut offset = self.pos;
 
         loop {
-            let part_length = self.read()?;
+            let len = self.buf[offset];
 
-            if part_length == 0 {
-                if cur_pos != 0 {
-                    self.seek(cur_pos);
+            // end of name
+            if len == 0 {
+                if !jumped {
+                    self.pos = offset + 1;
                 }
                 break;
             }
 
-            if part_length & 0xC0 == 0xC0 {
-                let jump_pos = (((part_length & 0x3F) as u16) << 8) | (self.read()? as u16);
-                cur_pos = self.get_pos();
-                self.seek(jump_pos as usize);
+            // pointer (compression)
+            if len & 0xC0 == 0xC0 {
+                let b2 = self.buf[offset + 1] as u16;
+                let pointer = (((len as u16) ^ 0xC0) << 8) | b2;
+
+                if !jumped {
+                    self.pos = offset + 2;
+                }
+                offset = pointer as usize;
+                jumped = true;
             } else {
-                out.push_str(&delim);
-                let end_index = self.pos + (part_length as usize);
-                let arr_slice = self.buf[self.pos..end_index]
-                    .try_into()
-                    .expect("Cannot slice the data");
-                self.pos = end_index as usize;
-                out.push_str(&String::from_utf8_lossy(arr_slice).to_lowercase());
+                offset += 1;
+                let label = &self.buf[offset..offset + (len as usize)];
+                out.push_str(delim);
+                out.push_str(&String::from_utf8_lossy(label).to_lowercase());
                 delim = ".";
+                offset += len as usize;
             }
         }
         Ok(())
@@ -193,8 +200,10 @@ impl DnsHeader {
         self.query = ((a >> 7) & 0x1) == 1;
         self.opcode = OpCode::from_num((a >> 3) & 0xF);
         self.authoritative_answer = (a >> 2 & 0x1) == 1;
+        self.truncation = (a >> 1 & 0x1) == 1;
         self.recursion_desired = (a & 0x1) == 1;
 
+        self.recursion_available = ((b >> 7) & 0x1) == 1;
         self.z = (b >> 4) & 0xF;
         self.response_code = ResponseCode::from_num(b & 0xF);
 
@@ -295,7 +304,10 @@ impl DnsQuestion {
 
 #[derive(Debug, PartialEq, Clone)]
 enum DnsRecord {
-    UNKOWN,
+    UNKNOWN {
+        domain: String,
+        qtype: u16,
+    },
     A {
         domain: String,
         addr: Ipv4Addr,
@@ -328,7 +340,9 @@ impl DnsRecord {
     fn read(buf_handler: &mut BufHandler) -> Result<DnsRecord, String> {
         let mut qname = String::new();
         buf_handler.read_qname(&mut qname)?;
+
         let qtype = QueryType::from_num(buf_handler.read_u16()?);
+
         let _qclass = buf_handler.read_u16()?;
         let ttl = buf_handler.read_u32()?;
         let _len = buf_handler.read_u16()?;
@@ -389,7 +403,10 @@ impl DnsRecord {
                 ),
             }),
 
-            _ => Ok(DnsRecord::UNKOWN),
+            _ => Ok(DnsRecord::UNKNOWN {
+                domain: qname,
+                qtype: qtype.to_num(),
+            }),
         }
     }
 
@@ -551,8 +568,8 @@ impl DnsPacket {
     }
 }
 
-fn google_lookup(qname: &String, qtype: QueryType) -> Result<DnsPacket, String> {
-    let udp_socket = UdpSocket::bind("0.0.0.0:9696").unwrap();
+fn lookup(qname: &String, qtype: QueryType, addr: Ipv4Addr) -> Result<DnsPacket, String> {
+    let udp_socket = UdpSocket::bind("0.0.0.0:34354").unwrap();
     let mut packet = DnsPacket::new();
     let mut buf_handler = BufHandler::new();
 
@@ -564,7 +581,7 @@ fn google_lookup(qname: &String, qtype: QueryType) -> Result<DnsPacket, String> 
     packet.write(&mut buf_handler)?;
 
     udp_socket
-        .send_to(&buf_handler.buf, ("8.8.8.8", 53))
+        .send_to(&buf_handler.buf[0..buf_handler.get_pos()], (addr, 53))
         .unwrap();
 
     buf_handler = BufHandler::new();
@@ -592,22 +609,28 @@ fn main() {
         response_packet.header.recursion_available = true;
         response_packet.header.authoritative_answer = true;
 
+        let mut packet: DnsPacket = DnsPacket::new();
+
         if let Some(question) = request_packet.questions.pop() {
-            let lookup_packet = google_lookup(&question.name, question.qtype).unwrap();
+            let mut current_address = "202.12.27.33".parse::<Ipv4Addr>().unwrap();
 
-            println!("Lookup Packet {:#?}", lookup_packet);
+            loop {
+                packet = lookup(&question.name, question.qtype, current_address).unwrap();
 
-            response_packet.questions.push(question);
+                if !packet.answers.is_empty() {
+                    break;
+                }
 
-            for answer in lookup_packet.answers {
-                response_packet.answers.push(answer);
+                for additional in packet.additionals {
+                    if let DnsRecord::A { addr, .. } = additional {
+                        current_address = addr;
+                    }
+                }
             }
-            for nameserver in lookup_packet.nameservers {
-                response_packet.nameservers.push(nameserver);
-            }
-            for additional in lookup_packet.additionals {
-                response_packet.answers.push(additional);
-            }
+        }
+
+        for answer in packet.answers {
+            response_packet.answers.push(answer);
         }
 
         buf_handler.seek(0);
