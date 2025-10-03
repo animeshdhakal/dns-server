@@ -1,4 +1,5 @@
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::UdpSocket;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -231,15 +232,34 @@ impl DnsHeader {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum QueryType {
-    A = 1,
+    A,
+    NS,
+    CNAME,
+    MX,
+    AAAA,
     UNKNOWN,
 }
 
 impl QueryType {
-    fn from_num(num: u8) -> QueryType {
+    fn from_num(num: u16) -> QueryType {
         match num {
             1 => QueryType::A,
+            2 => QueryType::NS,
+            5 => QueryType::CNAME,
+            15 => QueryType::MX,
+            28 => QueryType::AAAA,
             _ => QueryType::UNKNOWN,
+        }
+    }
+
+    fn to_num(&self) -> u16 {
+        match *self {
+            QueryType::A => 1,
+            QueryType::NS => 2,
+            QueryType::CNAME => 5,
+            QueryType::MX => 15,
+            QueryType::AAAA => 28,
+            QueryType::UNKNOWN => 0,
         }
     }
 }
@@ -260,14 +280,14 @@ impl DnsQuestion {
 
     fn read(&mut self, buf_handler: &mut BufHandler) -> Result<(), String> {
         buf_handler.read_qname(&mut self.name)?;
-        self.qtype = QueryType::from_num(buf_handler.read_u16()? as u8);
+        self.qtype = QueryType::from_num(buf_handler.read_u16()?);
         let _qclass = buf_handler.read_u16()?;
         Ok(())
     }
 
     fn write(&self, buf_handler: &mut BufHandler) -> Result<(), String> {
         buf_handler.write_qname(&self.name)?;
-        buf_handler.write_u16(self.qtype as u16)?;
+        buf_handler.write_u16(self.qtype.to_num())?;
         buf_handler.write_u16(1)?;
         Ok(())
     }
@@ -278,8 +298,29 @@ enum DnsRecord {
     UNKOWN,
     A {
         domain: String,
-        ip: Ipv4Addr,
+        addr: Ipv4Addr,
         ttl: u32,
+    },
+    NS {
+        domain: String,
+        ttl: u32,
+        host: String,
+    },
+    CNAME {
+        domain: String,
+        ttl: u32,
+        host: String,
+    },
+    MX {
+        domain: String,
+        ttl: u32,
+        priority: u16,
+        host: String,
+    },
+    AAAA {
+        domain: String,
+        ttl: u32,
+        addr: Ipv6Addr,
     },
 }
 
@@ -287,15 +328,15 @@ impl DnsRecord {
     fn read(buf_handler: &mut BufHandler) -> Result<DnsRecord, String> {
         let mut qname = String::new();
         buf_handler.read_qname(&mut qname)?;
-        let qtype = QueryType::from_num(buf_handler.read_u16()? as u8);
-        let qclass = buf_handler.read_u16()?;
+        let qtype = QueryType::from_num(buf_handler.read_u16()?);
+        let _qclass = buf_handler.read_u16()?;
         let ttl = buf_handler.read_u32()?;
-        let len = buf_handler.read_u16()?;
+        let _len = buf_handler.read_u16()?;
 
         match qtype {
             QueryType::A => Ok(DnsRecord::A {
                 domain: qname,
-                ip: Ipv4Addr::new(
+                addr: Ipv4Addr::new(
                     buf_handler.read()?,
                     buf_handler.read()?,
                     buf_handler.read()?,
@@ -303,6 +344,51 @@ impl DnsRecord {
                 ),
                 ttl: ttl,
             }),
+            QueryType::NS => {
+                let mut ns = String::new();
+                buf_handler.read_qname(&mut ns)?;
+                Ok(DnsRecord::NS {
+                    domain: qname,
+                    ttl: ttl,
+                    host: ns,
+                })
+            }
+            QueryType::CNAME => {
+                let mut cname = String::new();
+                buf_handler.read_qname(&mut cname)?;
+                Ok(DnsRecord::CNAME {
+                    domain: qname,
+                    ttl: ttl,
+                    host: cname,
+                })
+            }
+            QueryType::MX => {
+                let priority = buf_handler.read_u16()?;
+                let mut mx = String::new();
+                buf_handler.read_qname(&mut mx)?;
+
+                Ok(DnsRecord::MX {
+                    domain: qname,
+                    ttl: ttl,
+                    priority: priority,
+                    host: mx,
+                })
+            }
+            QueryType::AAAA => Ok(DnsRecord::AAAA {
+                domain: qname,
+                ttl: ttl,
+                addr: Ipv6Addr::new(
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                    buf_handler.read_u16()?,
+                ),
+            }),
+
             _ => Ok(DnsRecord::UNKOWN),
         }
     }
@@ -311,20 +397,75 @@ impl DnsRecord {
         match *self {
             DnsRecord::A {
                 ref domain,
-                ref ip,
+                ref addr,
                 ttl,
             } => {
                 buf_handler.write_qname(domain)?;
-                buf_handler.write_u16(QueryType::A as u16)?;
+                buf_handler.write_u16(QueryType::A.to_num())?;
                 buf_handler.write_u16(1)?;
                 buf_handler.write_u32(ttl)?;
                 buf_handler.write_u16(4)?;
 
-                let octets = ip.octets();
-                buf_handler.write(octets[0])?;
-                buf_handler.write(octets[1])?;
-                buf_handler.write(octets[2])?;
-                buf_handler.write(octets[3])?;
+                for octet in addr.octets() {
+                    buf_handler.write(octet)?;
+                }
+            }
+            DnsRecord::AAAA {
+                ref domain,
+                ref addr,
+                ttl,
+            } => {
+                buf_handler.write_qname(domain)?;
+                buf_handler.write_u16(QueryType::AAAA.to_num())?;
+                buf_handler.write_u16(1)?;
+                buf_handler.write_u32(ttl)?;
+                buf_handler.write_u16(16)?;
+
+                for segment in addr.segments() {
+                    buf_handler.write_u16(segment)?;
+                }
+            }
+            DnsRecord::NS {
+                ref domain,
+                ttl,
+                ref host,
+            } => {
+                buf_handler.write_qname(domain)?;
+                buf_handler.write_u16(QueryType::NS.to_num())?;
+                buf_handler.write_u16(1)?;
+                buf_handler.write_u32(ttl)?;
+
+                buf_handler.write_u16((host.len() + 2) as u16)?;
+                buf_handler.write_qname(host)?;
+            }
+            DnsRecord::CNAME {
+                ref domain,
+                ttl,
+                ref host,
+            } => {
+                buf_handler.write_qname(domain)?;
+                buf_handler.write_u16(QueryType::CNAME.to_num())?;
+                buf_handler.write_u16(1)?;
+                buf_handler.write_u32(ttl)?;
+
+                buf_handler.write_u16((host.len() + 2) as u16)?;
+                buf_handler.write_qname(host)?;
+            }
+
+            DnsRecord::MX {
+                ref domain,
+                ttl,
+                ref host,
+                priority,
+            } => {
+                buf_handler.write_qname(domain)?;
+                buf_handler.write_u16(QueryType::MX.to_num())?;
+                buf_handler.write_u16(1)?;
+                buf_handler.write_u32(ttl)?;
+
+                buf_handler.write_u16((host.len() + 4) as u16)?;
+                buf_handler.write_u16(priority)?;
+                buf_handler.write_qname(host)?;
             }
             _ => {}
         }
@@ -350,6 +491,12 @@ impl DnsPacket {
             nameservers: Vec::new(),
             additionals: Vec::new(),
         }
+    }
+
+    fn from_buffer(buf_handler: &mut BufHandler) -> Result<Self, String> {
+        let mut packet = Self::new();
+        packet.read(buf_handler)?;
+        Ok(packet)
     }
 
     fn read(&mut self, buf_reader: &mut BufHandler) -> Result<(), String> {
@@ -404,32 +551,70 @@ impl DnsPacket {
     }
 }
 
-fn main() {
-    let mut buf_reader = BufHandler::new();
+fn google_lookup(qname: &String, qtype: QueryType) -> Result<DnsPacket, String> {
+    let udp_socket = UdpSocket::bind("0.0.0.0:9696").unwrap();
+    let mut packet = DnsPacket::new();
+    let mut buf_handler = BufHandler::new();
 
-    let mut dns_packet = DnsPacket::new();
-    dns_packet.header.id = 6262;
-    dns_packet.header.recursion_desired = true;
-    dns_packet.questions.push(DnsQuestion {
-        name: "animeshdhakal.com.np".to_string(),
-        qtype: QueryType::A,
+    packet.header.recursion_desired = true;
+    packet.questions.push(DnsQuestion {
+        name: qname.to_string(),
+        qtype: qtype,
     });
+    packet.write(&mut buf_handler)?;
 
-    dns_packet.write(&mut buf_reader).unwrap();
+    udp_socket
+        .send_to(&buf_handler.buf, ("8.8.8.8", 53))
+        .unwrap();
 
+    buf_handler = BufHandler::new();
+    packet = DnsPacket::new();
+
+    udp_socket.recv_from(&mut buf_handler.buf).unwrap();
+    packet.read(&mut buf_handler)?;
+
+    Ok(packet)
+}
+
+fn main() {
     let udp_socket = UdpSocket::bind("0.0.0.0:6969").unwrap();
+    let mut buf_handler = BufHandler::new();
 
-    // udp_socket
-    //     .send_to(&buf_reader.buf, ("8.8.8.8", 53))
-    //     .unwrap();
+    loop {
+        let (_, src) = udp_socket.recv_from(&mut buf_handler.buf).unwrap();
 
-    buf_reader = BufHandler::new();
-    dns_packet = DnsPacket::new();
+        buf_handler.seek(0);
+        let mut request_packet = DnsPacket::from_buffer(&mut buf_handler).unwrap();
 
-    let (size, src) = udp_socket.recv_from(&mut buf_reader.buf).unwrap();
-    dns_packet.read(&mut buf_reader).unwrap();
+        let mut response_packet = DnsPacket::new();
+        response_packet.header.id = request_packet.header.id;
+        response_packet.header.recursion_desired = true;
+        response_packet.header.recursion_available = true;
+        response_packet.header.authoritative_answer = true;
 
-    udp_socket.send_to(&buf_reader.buf, &src).unwrap();
+        if let Some(question) = request_packet.questions.pop() {
+            let lookup_packet = google_lookup(&question.name, question.qtype).unwrap();
 
-    println!("{:#?}", dns_packet);
+            println!("Lookup Packet {:#?}", lookup_packet);
+
+            response_packet.questions.push(question);
+
+            for answer in lookup_packet.answers {
+                response_packet.answers.push(answer);
+            }
+            for nameserver in lookup_packet.nameservers {
+                response_packet.nameservers.push(nameserver);
+            }
+            for additional in lookup_packet.additionals {
+                response_packet.answers.push(additional);
+            }
+        }
+
+        buf_handler.seek(0);
+        response_packet.write(&mut buf_handler).unwrap();
+
+        udp_socket
+            .send_to(&buf_handler.buf[0..buf_handler.get_pos()], src)
+            .unwrap();
+    }
 }
